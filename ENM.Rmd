@@ -1,0 +1,252 @@
+---
+title: "Ecological niche modeling"
+author: "Claire M Williams"
+date: "5/26/2021"
+output:
+  html_document:
+    number_sections: true
+    toc: TRUE
+    toc_depth: 4
+    theme: sandstone
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This tutorial is modeled after a tutorial done by Drew Kerkhoff
+https://cmerow.github.io/RDataScience/3_6_Teaching_Ecoinformatics.html
+
+# Ecological niche modeling
+Ecological niche modeling is a very versatile tool used by both modern and paleo ecologists. There are many ways to run ecological niche models but for the short tutorial we will walk through using one of the most popular algorithms, MAXENT from (Phillips et al., 2006)
+
+We will be modeling the niche of an invasive species of coral, *Tubastraea coccinea*, the orange cup coral. *T. coccinea* is native to the pacific ocean but has since invaded other areas such as the Gulf of Mexico. This tutorial is based off an ENM created by Carlos-Junior et al., 2015 which modeled *T. coccinea*.
+
+# Installing required packages
+R packages contain groups of reusable functions, the documentation that describes how to use them, and sample data. 
+
+
+```{r}
+install.packages("raster") #this package does reading writing manipulating and analyzing spatial data, we use to crop the extent of our data
+`#`install.packages("maptools") #base maps for our plots
+install.packages("mapdata") # how to make the higher resolution base maps
+install.packages("dismo") #has maxent
+install.packages("sdmpredictors") #has environmental layers from Bio-ORACLE
+install.packages('dichromat') #has color pallet for graphs
+install.packages('rJava') #required to run maxent
+install.packages('RCurl')
+install.packages('regal')
+install.packages(' R.utils')
+install.packages('maps')  
+install.packages('Rcpp')
+install.packages('sp')
+```
+
+Once the packages are installed, they need to be called into your r session so the functions within them can be used using the function "library()".
+
+``` {r}
+library(raster)
+library(mapdata)
+library(dismo) 
+library(maptools)
+library(sdmpredictors)
+library(dichromat)
+library(rJava) 
+#library(RCurl)
+#library(rgdal)
+#library(R.utils)
+#library(maps)  
+#library(sp)
+```
+
+# Environmental Data
+
+As you remember there are two types of data required for ENM, the environmental information that is important for the species survival, and the occurrence records. There are many ways to obtain the environmental information (see slides) but for this simplified tutorial we will use data from the database Bio-ORACLE on modern ocean information. Bio-ORACLE is a set of GIS raster providing geophysical, biotic and environmental data for surface and benthic marine realms at a spatial resolution 5 arcmin (9.2 km).
+
+```{r}
+layers.bio2 <- list_layers( datasets="Bio-ORACLE" ) # from sdm
+#layers.bio2 # really long list, uncomment(remove #) if interested
+```
+
+The layers used by Carlos-Junior et al., 2015 were: 
+calcite,
+photosynthetically available radiation,
+pH,
+salinity,
+dissolved oxygen,
+nitrate,
+chrolophyll max,
+
+For Bio-ORACLE the layers are:
+BO_calcite, 
+BO_parmax, 
+BO_ph,
+BO_salinity,
+BO_dissox, 
+BO_nitrate, 
+BO_chlomax
+
+
+
+```{r}
+currentEnv <- load_layers(c("BO_calcite", "BO_parmax", "BO_ph", "BO_salinity", "BO_dissox", "BO_nitrate", "BO_chlomax")) #from sdm
+```
+
+# Occurrence data
+
+The second type of data requires is the occurrence information about where the species was found. We will download all the records of the orange cup coral from gbif using the function in the package "dismo". These records are only presences which you can see if you look at the downloaded "coral".
+
+```{r}
+coral=gbif('tubastraea',species = 'coccinea') #in dismo
+```
+
+Once the occurrence data is downloaded into r, the data needs to be cleaned so that all we have is the latitude and longitude and remove all missing data.
+
+```{r}
+coral=subset(coral, !is.na(lon) & !is.na(lat)) # selecting only the latitude and longitude columns from the downloaded data
+coraldups=duplicated(coral[, c("lon", "lat")]) #removing the duplicates
+coral <-coral[!coraldups, ]
+```
+
+# Setting up the occurrence and environmental data for the model
+
+First, lets visualize our data by making a preliminary map to see how the observations of *T. coccinea* are distributed. We will make map extend 1 degree around observations.
+
+```{r}
+data(wrld_simpl) #from maptools
+plot(wrld_simpl, xlim=c(min(coral$lon)-1,max(coral$lon)+1), ylim=c(min(coral$lat)-1,max(coral$lat)+1), axes=TRUE, col="light yellow")
+points(coral$lon, coral$lat, col="red", pch=20, cex=0.75)
+```
+
+Now, we will crop the occurrence data to the native range and will use that to train our model. For this we will limit the training data to roughly the native range from Carlos-Junior et al., 2015
+
+```{r}
+coral <- coral[coral$lon > 60 & coral$lat < 40 , ]
+```
+
+Once again, we shall visualize what our coral data looks like with a higher resolution world map
+
+```{r}
+map('worldHires', xlim=c(min(coral$lon)-1,max(coral$lon)+1), ylim=c(min(coral$lat)-1,max(coral$lat)+1), fill=TRUE, col="light yellow") #maptools package
+points(coral$lon, coral$lat, col="red", pch=20, cex=0.75)
+```
+
+Since this model is oversimplified, we will simply crop the extent of our environmental data to just ten degrees around the extremes of the species range. In normal practice this cropping of environmental data is much more sophisticated.
+
+To trim all of our environmental data to this region we can define a geographic extent then crop the climate raster data to this extent.
+
+```{r}
+model.extent<-extent(min(coral$lon)-10,max(coral$lon)+10,min(coral$lat)-10,max(coral$lat)+10) #in raster package, defining extent
+modelEnv=crop(currentEnv, model.extent) #cropping layers
+```
+
+To get an idea of how the environment varies across the species range, let’s look at calcite in this native range.
+
+```{r}
+plot(modelEnv[["BO_calcite"]], main="Native Range Calcite")
+map('worldHires',xlim=c(min(coral$lon)-10,max(coral$lon)+10), ylim=c(min(coral$lat)-10,max(coral$lat)+10), fill=FALSE, add=TRUE)
+points(coral$lon, coral$lat, pch="+", cex=0.2)
+```
+
+For this tutorial we will use ecological niche modeling to look at suitable habitat for *T. coccinea* outside of its native range to see if we can predict where it has invaded and where it may invade in the future. To do that we need to prepare a cropped extend in one of the areas the species has invaded: the Gulf of Mexico. We will prepare this the same way we prepared the native range
+
+```{r}
+invas.extent<-extent(-99,-70,10,30) #defining extent
+invasEnv=crop(currentEnv,invas.extent) #cropping to that extent
+```
+
+To get an idea of how the environment varies across the invaded area, and to verify that our cropping worked, let’s look at calcite in this invaded range.
+
+``` {r}
+plot(invasEnv[["BO_calcite"]], main="Invasive Region Calcite")
+map('worldHires', xlim=c(-99,-70), ylim=c(10,30), fill=FALSE, add=TRUE)
+```
+
+
+# Separating training and testing datasets
+
+We will randomly withhold 20% of the observations as test data and retain the other 80% as training data.
+
+```{r}
+coralocc=cbind.data.frame(coral$lon,coral$lat) #first, just make a data frame of latitudes and longitudes for the model
+fold <- kfold(coralocc, k=5) # add an index that makes five random groups of observations
+coraltest <- coralocc[fold == 1, ] # hold out one fifth as test data
+coraltrain <- coralocc[fold != 1, ] # the other four fifths are training data
+```
+
+In real applications, since the particulars of the model depend on the data used to fit it, we would actually fit the model multiple times -- here just do once.
+
+# Running the maxent
+
+Running the maxent is really simple using the dismo package. It just requires the function maxent(environmental data, occurrence data).
+Maxent is more complicated than this simple tutorial illustrates and has parameters to be optimized. There are many helpful tutorials and papers on this if you are interested, but for this tutorial we will not get into the weeds. 
+```{r}
+coral.me <- maxent(modelEnv, coraltrain)
+```
+
+# Evaluation
+
+Now that the model is run, we can look at how well the model preformed. To do that we will look at the commonly used AUC.
+
+As you are aware, we only have presence data, not absences. Luckily, the AUC procedure can be adapted for presence only data by generating ‘pseudoabsences’ from random points within the region. There are many caveats to this process.
+
+To generate and evaluate the AUC for our model, we first generate background points for pseudoabsences. 
+
+The ‘randomPoints()’ function even makes sure that the points occur only in areas where the predictor variables exist
+
+```{r}
+bg <- randomPoints(modelEnv, 1000)
+```
+
+Then we can use ‘evaluate()’ to generate several diagnostics as well as the AUC, using our test data as our presences against our pseudoabsences.
+
+```{r}
+e1 <- evaluate(coral.me, p=coraltest, a=bg, x=modelEnv)
+plot(e1, 'ROC')
+```
+
+# Model visualization and validation
+
+Since the model preformed well we can look at the results. First, lets look to see which environmental variables are the most important.
+
+```{r}
+plot(coral.me)
+```
+
+From this plot, we can see this is similar to the results from Carlos-Junior et al., 2015 with calcite and nitrate and chlomax being the most important variables for this species distribution.
+
+With our modeled niche we can predict locations of suitable habitat. 
+
+```{r}
+coral.pred <- predict(coral.me, modelEnv)
+```
+
+Then, we can map those predicted values and add in the species occurence points to see how well the prediction did.
+
+```{r}
+cl2 <- colorRampPalette(c('blue','green','gray','yellow','orange','red')) # creating color pallet to use in graph
+plot(coral.pred, main="Predicted habitat suitability in native range", col=cl2(200)) #plotting the predicted suitability
+map('worldHires', fill=FALSE, add=TRUE)
+points(coral$lon, coral$lat, cex=0.5, col = 'grey') #adding the occurrence points
+```
+
+In this plot, red and orange indicates that those areas are more suitable habitat locations than the cooler colors (green and blue) as shown by the scale on the right side. The areas of more suitable habitat correspond well with the occurrence points indicating that the model was able to predict those locations well.
+
+# Projecting suitable habitat in invaded region
+
+We can also look at the distribution of potential habitat in the invaded regions of the Gulf of Mexico. This can help predict where this species will invade in the future.
+
+```{r}
+coral.invas = predict(coral.me, invasEnv)
+```
+
+Just as before, we can then map the predicted values.
+
+```{r}
+plot(coral.invas, main="Habitat suitability in Gulf of Mexico", col=cl2(200))
+map('worldHires', fill=FALSE, add=TRUE)
+```
+
+
+
+
